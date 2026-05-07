@@ -37,7 +37,7 @@ from eth_account import Account
 CHAINS = {
     "eth": {
         "name": "Ethereum",
-        "rpc": os.environ.get("ETH_RPC", "https://ethereum-rpc.publicnode.com"),
+        "rpc": os.environ.get("ETH_RPC", "https://eth-mainnet.g.alchemy.com/v2/7buu4S60OTzXYC_kCwRou"),
         "chain_id": 1,
         "explorer": "https://etherscan.io/tx/",
         "abi_url": "https://api.etherscan.io/api",
