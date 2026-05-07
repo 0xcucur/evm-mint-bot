@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────
+# ⚠️  NEVER COMMIT THESE
+# ─────────────────────────────────────────────
+
+# Wallets & private keys
+*.key
+*.pem
+*.keystore
+wallets.json
+# Env (allow .env.example)
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
