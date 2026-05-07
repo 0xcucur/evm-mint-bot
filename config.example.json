@@ -1,0 +1,13 @@
+{
+    "chain": "base",
+    "contract": "0x0000000000000000000000000000000000000000",
+    "mint_fn": "mint",
+    "quantity": 1,
+    "value": 0.01,
+    "gas_limit": null,
+    "max_gas_price_gwei": 50,
+    "poll_interval_sec": 0.3,
+    "max_retries": 5,
+    "retry_delay_sec": 0.2,
+    "private_key": "AUTO_LOADED_FROM_WALLETS_JSON"
+}

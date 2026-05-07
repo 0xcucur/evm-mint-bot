@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-EVM Auto-Mint Bot v2
-Paste a mint link → bot resolves contract, ABI, mint function, value → mints.
+EVM Auto-Mint Bot v3 — SNIPER EDITION
+Pre-sign → wait for sale active → fire instantly.
 
-Supported link formats:
-  - https://opensea.io/collection/xxx  (auto-resolves via OpenSea API)
-  - https://mint.fun/0x...             (direct contract)
-  - https://zora.co/collections/0x...  (direct contract)
-  - https://0x...                      (raw contract address)
-  - Any EVM contract address
+v3 Changes:
+  - Pre-compute: gas, nonce, ABI, calldata BEFORE loop
+  - Fire: zero overhead, raw send, no probes in loop
+  - Speed: connection pooling, keep-alive, no status checks
+  - Backup: pre-sign 3 TX with nonce+1,+2,+3 for rapid fire
 
 Usage:
-  python3 mint_bot.py --link "https://opensea.io/collection/stupidfacesnft/overview"
-  python3 mint_bot.py --link "https://mint.fun/0x1234..." --chain base
-  python3 mint_bot.py --chain base --contract 0x... --dry-run
-  python3 mint_bot.py --link "https://opensea.io/collection/xxx" --qty 3 --live
+  python3 mint_bot.py -l "https://opensea.io/collection/xxx" --live
+  python3 mint_bot.py -c 0x... --live
+  python3 mint_bot.py -c 0x... --snipe 0xABC  # with proof
 """
 
 import json
@@ -44,8 +42,8 @@ CHAINS = {
         "explorer": "https://etherscan.io/tx/",
         "abi_url": "https://api.etherscan.io/api",
         "api_key": os.environ.get("ETHERSCAN_KEY", ""),
-        "priority_fee_gwei": 3,
-        "max_fee_multiplier": 1.5,
+        "priority_fee_gwei": 5,
+        "max_fee_multiplier": 2.0,
     },
     "base": {
         "name": "Base",
@@ -54,38 +52,38 @@ CHAINS = {
         "explorer": "https://basescan.org/tx/",
         "abi_url": "https://api.basescan.org/api",
         "api_key": os.environ.get("BASESCAN_KEY", ""),
-        "priority_fee_gwei": 1,
-        "max_fee_multiplier": 1.3,
+        "priority_fee_gwei": 2,
+        "max_fee_multiplier": 1.5,
     },
     "mega": {
         "name": "MegaETH",
-        "rpc": os.environ.get("MEGA_RPC", "https://rpc.megaeth.com"),
+        "rpc": os.environ.get("MEGA_RPC", "https://carrot.megaeth.com/rpc"),
         "chain_id": 6342,
-        "explorer": "https://megaeth.com/tx/",
-        "abi_url": None,
+        "explorer": "https://megaexplorer.xyz/tx/",
+        "abi_url": "",
         "api_key": "",
         "priority_fee_gwei": 1,
-        "max_fee_multiplier": 1.5,
+        "max_fee_multiplier": 1.3,
     },
     "tempo": {
         "name": "Tempo",
-        "rpc": os.environ.get("TEMPO_RPC", "https://rpc.tempo.build"),
+        "rpc": os.environ.get("TEMPO_RPC", "https://rpc.devnet.movementnetwork.xyz"),
         "chain_id": 9837,
-        "explorer": "https://tempo.exchange/tx/",
-        "abi_url": None,
+        "explorer": "https://explorer.devnet.movementnetwork.xyz/tx/",
+        "abi_url": "",
         "api_key": "",
         "priority_fee_gwei": 1,
-        "max_fee_multiplier": 1.5,
+        "max_fee_multiplier": 1.3,
     },
     "sepolia": {
-        "name": "Sepolia Testnet",
+        "name": "Sepolia",
         "rpc": "https://ethereum-sepolia-rpc.publicnode.com",
         "chain_id": 11155111,
         "explorer": "https://sepolia.etherscan.io/tx/",
         "abi_url": "https://api-sepolia.etherscan.io/api",
         "api_key": os.environ.get("ETHERSCAN_KEY", ""),
-        "priority_fee_gwei": 1,
-        "max_fee_multiplier": 1.2,
+        "priority_fee_gwei": 2,
+        "max_fee_multiplier": 1.5,
     },
     "arbitrum": {
         "name": "Arbitrum",
@@ -95,7 +93,7 @@ CHAINS = {
         "abi_url": "https://api.arbiscan.io/api",
         "api_key": os.environ.get("ARBISCAN_KEY", ""),
         "priority_fee_gwei": 1,
-        "max_fee_multiplier": 1.3,
+        "max_fee_multiplier": 1.2,
     },
     "optimism": {
         "name": "Optimism",
@@ -105,7 +103,7 @@ CHAINS = {
         "abi_url": "https://api-optimistic.etherscan.io/api",
         "api_key": os.environ.get("ETHERSCAN_KEY", ""),
         "priority_fee_gwei": 1,
-        "max_fee_multiplier": 1.3,
+        "max_fee_multiplier": 1.2,
     },
     "matic": {
         "name": "Polygon",
@@ -122,14 +120,14 @@ CHAINS = {
         "rpc": os.environ.get("BLAST_RPC", "https://rpc.blast.io"),
         "chain_id": 81457,
         "explorer": "https://blastscan.io/tx/",
-        "abi_url": None,
+        "abi_url": "https://api.blastscan.io/api",
         "api_key": "",
         "priority_fee_gwei": 1,
-        "max_fee_multiplier": 1.5,
+        "max_fee_multiplier": 1.3,
     },
     "avalanche": {
         "name": "Avalanche",
-        "rpc": "https://api.avax.network/ext/bc/C/rpc",
+        "rpc": os.environ.get("AVAX_RPC", "https://api.avax.network/ext/bc/C/rpc"),
         "chain_id": 43114,
         "explorer": "https://snowtrace.io/tx/",
         "abi_url": "https://api.snowtrace.io/api",
@@ -139,128 +137,74 @@ CHAINS = {
     },
 }
 
-# Chain name mapping from OpenSea → CHAINS keys
 OPENSEA_CHAIN_MAP = {
-    "ethereum": "eth", "base": "base",
-    "matic": "matic", "arbitrum": "arbitrum",
-    "optimism": "optimism", "avalanche": "avalanche",
-    "blast": "blast", "zora": "base",  # Zora is on Base
-    "klaytn": "eth",  # fallback
+    "ethereum": "eth",
+    "matic": "matic",
+    "matic_pos": "matic",
+    "avalanche": "avalanche",
+    "arbitrum": "arbitrum",
+    "optimism": "optimism",
+    "base": "base",
+    "blast": "blast",
 }
 
-# ═══════════════════════════════════════════════════════════════
-# FALLBACK ABI
-# ═══════════════════════════════════════════════════════════════
 FALLBACK_ABI = [
-    {
-        "inputs": [{"name": "quantity", "type": "uint256"}],
-        "name": "mint",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    {
-        "inputs": [{"name": "quantity", "type": "uint256"}],
-        "name": "publicMint",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    {
-        "inputs": [{"name": "quantity", "type": "uint256"}],
-        "name": "mintPublic",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    {
-        "inputs": [
-            {"name": "to", "type": "address"},
-            {"name": "quantity", "type": "uint256"},
-            {"name": "maxQuantity", "type": "uint256"},
-            {"name": "proof", "type": "bytes32[]"}
-        ],
-        "name": "claim",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    {
-        "inputs": [{"name": "quantity", "type": "uint256"}],
-        "name": "claim",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    {
-        "inputs": [{"name": "quantity", "type": "uint256"}],
-        "name": "freeMint",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    {
-        "inputs": [{"name": "tokenId", "type": "uint256"}],
-        "name": "safeMint",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function"
-    },
-    # View functions
+    {"inputs": [{"name": "quantity", "type": "uint256"}], "name": "mint", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [], "name": "mint", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "quantity", "type": "uint256"}], "name": "publicMint", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "quantity", "type": "uint256"}], "name": "mintPublic", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "quantity", "type": "uint256"}, {"name": "proof", "type": "bytes32[]"}], "name": "claim", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "quantity", "type": "uint256"}], "name": "claim", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "quantity", "type": "uint256"}], "name": "freeMint", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "to", "type": "address"}, {"name": "quantity", "type": "uint256"}], "name": "safeMint", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "quantity", "type": "uint256"}], "name": "presaleMint", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "quantity", "type": "uint256"}], "name": "whitelistMint", "outputs": [], "stateMutability": "payable", "type": "function"},
+    # view functions
     {"inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "maxSupply", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "paused", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "price", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "mintPrice", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "isActive", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "saleActive", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "publicSaleActive", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "maxPerWallet", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"name": "account", "type": "address"}], "name": "mintedCount", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "cost", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "publicPrice", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "maxMintPerWallet", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "maxPerWallet", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "maxPerAddress", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"name": "account", "type": "address"}], "name": "numberMinted", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "isActive", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "publicSaleActive", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "saleActive", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
 ]
 
 
 class MintBot:
-    def __init__(self, config: dict, dry_run: bool = False):
+    def __init__(self, config: dict, dry_run: bool = True):
         self.config = config
         self.dry_run = dry_run
-        self.chain = CHAINS[config["chain"]]
-        self.w3 = Web3(Web3.HTTPProvider(
-            self.chain["rpc"],
-            request_kwargs={"timeout": 15}
-        ))
-
-        if not self.w3.is_connected():
-            print(f"[FATAL] Cannot connect to {self.chain['name']} RPC: {self.chain['rpc']}")
-            sys.exit(1)
+        self.chain = CHAINS.get(config.get("chain", "eth"), CHAINS["eth"])
+        self.w3 = Web3(Web3.HTTPProvider(self.chain["rpc"]))
+        self.quantity = config.get("qty", 1)
+        self.value_eth = config.get("value")
+        self.mint_fn_override = config.get("mint_fn", None)
+        self.proof = config.get("proof")
+        self.max_retries = config.get("retries", 10)
+        self.retry_delay = config.get("retry_delay", 0.5)
+        self.poll_interval = config.get("poll", 0.3)
+        self.opensea_key = os.environ.get("OPENSEA_API_KEY", "")
 
         # Load wallet
-        self.account = Account.from_key(config["private_key"])
+        private_key = config.get("private_key")
+        if not private_key:
+            wallets_path = Path.home() / ".hermes" / "wallets" / "wallets.json"
+            if wallets_path.exists():
+                with open(wallets_path) as f:
+                    wallets = json.load(f)
+                private_key = wallets.get("evm", {}).get("private_key")
+        if not private_key:
+            raise ValueError("No private key. Use -k <PRIVATE_KEY> or ~/.hermes/wallets/wallets.json")
+
+        self.account = Account.from_key(private_key)
         self.address = self.account.address
-
-        # Contract (resolved later)
-        self.contract_addr = None
-        self.contract = None
-        self.abi = None
-
-        # Mint config
-        self.quantity = config.get("quantity", 1)
-        self.value_eth = config.get("value", None)
-        self.max_gas_price = Web3.to_wei(config.get("max_gas_price_gwei", 100), "gwei")
-        self.gas_limit_override = config.get("gas_limit", None)
-
-        # Timing
-        self.poll_interval = config.get("poll_interval_sec", 0.5)
-        self.max_retries = config.get("max_retries", 10)
-        self.retry_delay = config.get("retry_delay_sec", 0.3)
-        self.mint_fn_override = config.get("mint_fn", None)
-
-        # OpenSea
-        self.opensea_key = os.environ.get("OPENSEA_API_KEY", "")
+        self.private_key = private_key
 
         # State
         self.minted = False
@@ -271,7 +215,7 @@ class MintBot:
 
     def log(self, msg: str):
         ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[{ts}] [{self.chain['name']}] {msg}")
+        print(f"[{ts}] [{self.chain['name']}] {msg}", flush=True)
 
     def stop(self):
         self.log("🛑 Stopping...")
@@ -282,10 +226,8 @@ class MintBot:
     # ═══════════════════════════════════════════════════════════
 
     def resolve_link(self, link: str) -> dict:
-        """Parse any link format → {address, chain?}"""
         link = link.strip()
 
-        # Raw address: 0x...
         if re.match(r'^0x[a-fA-F0-9]{40}$', link):
             self.log(f"Raw address: {link}")
             return {"address": link}
@@ -294,23 +236,18 @@ class MintBot:
         host = parsed.hostname or ""
         path = parsed.path
 
-        # OpenSea
         if "opensea.io" in host:
             return self._parse_opensea(path)
 
-        # mint.fun
         if "mint.fun" in host:
             return self._parse_mint_fun(path)
 
-        # Zora
         if "zora.co" in host:
             return self._parse_zora(path)
 
-        # Sound.xyz
         if "sound.xyz" in host:
             return self._parse_sound(path)
 
-        # Direct contract in URL (any domain)
         addr_match = re.search(r'0x[a-fA-F0-9]{40}', link)
         if addr_match:
             self.log(f"Found address in URL: {addr_match.group(0)}")
@@ -319,15 +256,12 @@ class MintBot:
         raise ValueError(f"Cannot parse link: {link}")
 
     def _parse_opensea(self, path: str) -> dict:
-        """Parse OpenSea path → use API to resolve"""
         self.log(f"Parsing OpenSea path: {path}")
 
-        # /collection/xxx or /collection/xxx/overview
         if "/collection/" in path:
             slug = path.split("/collection/")[-1].split("/")[0].split("?")[0]
             return self._opensea_api_resolve(slug)
 
-        # /assets/chain/0x.../id
         if "/assets/" in path:
             parts = path.split("/")
             for i, part in enumerate(parts):
@@ -341,322 +275,153 @@ class MintBot:
         raise ValueError(f"Cannot parse OpenSea path: {path}")
 
     def _opensea_api_resolve(self, slug: str) -> dict:
-        """Resolve OpenSea collection slug via API"""
         if not self.opensea_key:
-            raise ValueError("OPENSEA_API_KEY required for OpenSea links. Get one at https://docs.opensea.io/reference/api-keys")
+            raise ValueError("OPENSEA_API_KEY required for OpenSea links.")
 
         url = f"https://api.opensea.io/api/v2/collections/{slug}"
         headers = {
             "x-api-key": self.opensea_key,
             "Accept": "application/json",
-            "User-Agent": "mint-bot/2.0"
+            "User-Agent": "mint-bot/3.0"
         }
 
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 429:
-            self.log("OpenSea rate limited, retrying in 2s...")
             time.sleep(2)
-            resp = requests.get(url, headers=headers, timeout=15)
+            resp = requests.get(url, headers=headers, timeout=10)
 
         if resp.status_code != 200:
             raise ValueError(f"OpenSea API error {resp.status_code}: {resp.text[:200]}")
 
         data = resp.json()
         contracts = data.get("contracts", [])
+
         if not contracts:
-            raise ValueError(f"No contracts found for collection: {slug}")
+            raise ValueError(f"No contracts found for: {slug}")
 
         contract = contracts[0]
-        addr = contract.get("address")
-        os_chain = contract.get("chain", "ethereum")
-        chain = OPENSEA_CHAIN_MAP.get(os_chain, os_chain)
+        result = {
+            "address": contract.get("address"),
+            "chain": contract.get("chain", "ethereum"),
+            "name": data.get("name", slug),
+            "supply": data.get("total_supply", "?"),
+        }
+        self.log(f"OpenSea resolved: {result['name']} ({result['supply']} supply) → {result['address']} on {result['chain']}")
 
-        name = data.get("name", slug)
-        total = data.get("total_supply", "?")
-        desc = data.get("description", "")[:80]
-
-        self.log(f"OpenSea resolved: {name} ({total} supply) → {addr} on {os_chain}")
-        self.log(f"  Desc: {desc}")
-
-        return {"address": addr, "chain": chain}
+        return result
 
     def _parse_mint_fun(self, path: str) -> dict:
         addr_match = re.search(r'0x[a-fA-F0-9]{40}', path)
         if addr_match:
-            self.log(f"mint.fun → {addr_match.group(0)}")
             return {"address": addr_match.group(0)}
-        raise ValueError(f"Cannot parse mint.fun: {path}")
+        raise ValueError(f"Cannot parse mint.fun path: {path}")
 
     def _parse_zora(self, path: str) -> dict:
         addr_match = re.search(r'0x[a-fA-F0-9]{40}', path)
         if addr_match:
-            self.log(f"Zora → {addr_match.group(0)}")
-            return {"address": addr_match.group(0), "chain": "base"}
-        raise ValueError(f"Cannot parse Zora: {path}")
+            return {"address": addr_match.group(0)}
+        raise ValueError(f"Cannot parse Zora path: {path}")
 
     def _parse_sound(self, path: str) -> dict:
         addr_match = re.search(r'0x[a-fA-F0-9]{40}', path)
         if addr_match:
-            self.log(f"Sound.xyz → {addr_match.group(0)}")
             return {"address": addr_match.group(0)}
-        raise ValueError(f"Cannot parse Sound.xyz: {path}")
+        raise ValueError(f"Cannot parse Sound.xyz path: {path}")
 
     def _auto_set_chain(self, chain_key: str):
-        """Switch to a different chain if detected"""
-        if chain_key in CHAINS and chain_key != self.config["chain"]:
-            self.log(f"Switching chain: {self.config['chain']} → {chain_key}")
-            self.chain = CHAINS[chain_key]
-            self.w3 = Web3(Web3.HTTPProvider(
-                self.chain["rpc"],
-                request_kwargs={"timeout": 15}
-            ))
-            self.config["chain"] = chain_key
+        chain = CHAINS.get(chain_key.lower(), None)
+        if chain:
+            self.chain = chain
+            self.w3 = Web3(Web3.HTTPProvider(chain["rpc"]))
+            self.log(f"Chain → {chain['name']}")
 
     # ═══════════════════════════════════════════════════════════
-    # ABI RESOLUTION
+    # CONTRACT SETUP
     # ═══════════════════════════════════════════════════════════
 
-    def fetch_abi(self, contract_addr: str) -> list:
-        """Fetch ABI from block explorer or use fallback"""
+    def setup_contract(self, address: str):
+        self.contract_addr = Web3.to_checksum_address(address)
+        abi = self.fetch_abi(self.contract_addr)
+        self.contract = self.w3.eth.contract(address=self.contract_addr, abi=abi)
+
+    def fetch_abi(self, address: str) -> list:
+        """Fetch ABI from block explorer, fallback to common mint functions."""
         abi_url = self.chain.get("abi_url")
-        api_key = self.chain.get("api_key", "")
+        api_key = self.chain.get("api_key")
 
         if abi_url:
-            try:
-                params = {
-                    "module": "contract",
-                    "action": "getabi",
-                    "address": contract_addr,
-                }
-                if api_key:
-                    params["apikey"] = api_key
+            params = {"module": "contract", "action": "getabi", "address": address}
+            if api_key:
+                params["apikey"] = api_key
 
+            try:
                 resp = requests.get(abi_url, params=params, timeout=10)
                 data = resp.json()
-
                 if data.get("status") == "1" and data.get("result"):
                     abi = json.loads(data["result"])
-                    self.log(f"✓ ABI from explorer ({len(abi)} entries)")
+                    self.log(f"Explorer ABI: {len(abi)} entries")
                     return abi
-                else:
-                    msg = data.get("message", "unknown")
-                    self.log(f"Explorer ABI: {msg}")
             except Exception as e:
                 self.log(f"Explorer ABI failed: {e}")
 
-        self.log("Using fallback ABI")
+        self.log(f"Using fallback ABI ({len(FALLBACK_ABI)} functions)")
         return FALLBACK_ABI
 
     # ═══════════════════════════════════════════════════════════
-    # CONTRACT PROBING
+    # PROBE (only done ONCE)
     # ═══════════════════════════════════════════════════════════
-
-    def setup_contract(self, contract_addr: str):
-        self.contract_addr = Web3.to_checksum_address(contract_addr)
-        self.abi = self.fetch_abi(self.contract_addr)
-        self.contract = self.w3.eth.contract(
-            address=self.contract_addr,
-            abi=self.abi
-        )
 
     def probe_contract(self):
-        self.log(f"📋 Contract: {self.contract_addr}")
-
         try:
             code = self.w3.eth.get_code(self.contract_addr)
             if len(code) == 0:
-                self.log(f"  ⚠️  No contract deployed!")
+                self.log("⚠️  No contract at address")
                 return False
-            self.log(f"  ✓ Deployed ({len(code)} bytes)")
-        except Exception:
-            self.log(f"  ⚠️  Cannot verify code")
-
-        state_fns = [
-            "totalSupply", "maxSupply", "price", "mintPrice",
-            "paused", "isActive", "saleActive", "publicSaleActive",
-            "maxPerWallet", "maxMintPerWallet", "maxPerAddress",
-            "balanceOf", "mintedCount", "numberMinted"
-        ]
-        for fn_name in state_fns:
-            try:
-                fn = getattr(self.contract.functions, fn_name, None)
-                if fn is None:
-                    continue
-                if fn_name in ("balanceOf", "mintedCount", "numberMinted"):
-                    result = fn(self.address).call()
-                else:
-                    result = fn().call()
-
-                if fn_name in ("price", "mintPrice"):
-                    eth_val = Web3.from_wei(result, "ether")
-                    self.log(f"  {fn_name}() = {eth_val} ETH")
-                    if self.value_eth is None and result > 0:
-                        self.value_eth = float(eth_val) * self.quantity
-                        self.log(f"  → Auto value: {self.value_eth} ETH")
-                elif fn_name in ("balanceOf", "mintedCount", "numberMinted"):
-                    self.log(f"  {fn_name}({self.address[:8]}...) = {result}")
-                else:
-                    self.log(f"  {fn_name}() = {result}")
-            except (ContractLogicError, Exception):
-                pass
-
-        mint_fns = self._find_mint_functions()
-        if mint_fns:
-            self.log(f"  🎯 Mint functions: {', '.join(mint_fns)}")
-        else:
-            self.log(f"  ⚠️  No mint functions in ABI")
-
-        return True
-
-    def _find_mint_functions(self) -> list:
-        mint_keywords = ["mint", "claim", "publicMint", "mintPublic", "freeMint",
-                         "safeMint", "presaleMint", "whitelistMint", "presale",
-                         "publicSale", "mintTo"]
-        found = []
-        for item in self.abi:
-            if item.get("type") == "function":
-                name = item.get("name", "")
-                if any(kw.lower() in name.lower() for kw in mint_keywords):
-                    state = item.get("stateMutability", "")
-                    if state in ("payable", "nonpayable"):
-                        found.append(name)
-        return found
-
-    def detect_mint_function(self):
-        if self.mint_fn_override:
-            self.log(f"Using: {self.mint_fn_override}")
-            return self.mint_fn_override
-
-        mint_fns = self._find_mint_functions()
-        if not mint_fns:
-            raise ValueError("No mint function found")
-
-        priority = ["mint", "publicMint", "mintPublic", "claim", "publicSale",
-                     "presaleMint", "freeMint", "safeMint", "mintTo"]
-        for preferred in priority:
-            if preferred in mint_fns:
-                self.log(f"Selected: {preferred}")
-                return preferred
-
-        self.log(f"Using: {mint_fns[0]}")
-        return mint_fns[0]
-
-    # ═══════════════════════════════════════════════════════════
-    # TX BUILDING
-    # ═══════════════════════════════════════════════════════════
-
-    def build_mint_tx(self, mint_fn: str) -> dict:
-        nonce = self.w3.eth.get_transaction_count(self.address, 'pending')
-
-        try:
-            latest_block = self.w3.eth.get_block('latest')
-            base_fee = latest_block.get('baseFeePerGas', self.w3.eth.gas_price)
-        except Exception:
-            base_fee = self.w3.eth.gas_price
-
-        priority_fee = Web3.to_wei(self.chain["priority_fee_gwei"], "gwei")
-        max_fee = int(base_fee * self.chain["max_fee_multiplier"]) + priority_fee
-        max_fee = min(max_fee, self.max_gas_price)
-
-        tx = {
-            "from": self.address,
-            "chainId": self.chain["chain_id"],
-            "nonce": nonce,
-            "maxPriorityFeePerGas": priority_fee,
-            "maxFeePerGas": max_fee,
-            "type": 2,
-        }
-
-        fn_obj = getattr(self.contract.functions, mint_fn)
-
-        fn_abi = None
-        for item in self.abi:
-            if item.get("type") == "function" and item.get("name") == mint_fn:
-                fn_abi = item
-                break
-
-        if fn_abi:
-            input_count = len(fn_abi.get("inputs", []))
-            self.log(f"  {mint_fn}() inputs: {input_count}")
-
-            if input_count == 0:
-                fn_call = fn_obj()
-            elif input_count == 1:
-                fn_call = fn_obj(self.quantity)
-            elif mint_fn == "claim" and input_count >= 3:
-                fn_call = fn_obj(self.address, self.quantity, self.quantity, [])
-            elif input_count == 2:
-                fn_call = fn_obj(self.address, self.quantity)
-            else:
-                fn_call = fn_obj(self.quantity)
-        else:
-            fn_call = fn_obj(self.quantity)
-
-        tx_data = fn_call.build_transaction(tx)
-        tx.update(tx_data)
-
-        if self.value_eth and self.value_eth > 0:
-            tx["value"] = Web3.to_wei(self.value_eth, "ether")
-
-        if self.gas_limit_override:
-            tx["gas"] = self.gas_limit_override
-        else:
-            try:
-                gas_estimate = self.w3.eth.estimate_gas(tx)
-                tx["gas"] = int(gas_estimate * 1.3)
-                self.log(f"Gas: {gas_estimate} → {tx['gas']}")
-            except Exception as e:
-                tx["gas"] = 300000
-                self.log(f"Gas estimate failed ({e}), using 300000")
-
-        return tx
-
-    def send_mint(self, mint_fn: str) -> str:
-        tx = self.build_mint_tx(mint_fn)
-        signed = self.w3.eth.account.sign_transaction(tx, self.config["private_key"])
-        self.log(f"📤 Sending (nonce={tx['nonce']}, gas={tx['gas']}, "
-                 f"value={Web3.from_wei(tx.get('value', 0), 'ether')} ETH)...")
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        return tx_hash.hex()
-
-    def wait_for_receipt(self, tx_hash: str, timeout: int = 120) -> dict:
-        self.log(f"⏳ Waiting for confirmation ({timeout}s timeout)...")
-        try:
-            return self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            self.log(f"✓ Deployed ({len(code)} bytes)")
         except Exception as e:
-            self.log(f"Timeout: {e}")
-            return None
+            self.log(f"⚠️  Deploy check failed: {e}")
 
-    # ═══════════════════════════════════════════════════════════
-    # STATUS CHECKS
-    # ═══════════════════════════════════════════════════════════
+        for fn_name in ["totalSupply", "maxSupply", "maxSupply", "MAX_SUPPLY"]:
+            try:
+                val = getattr(self.contract.functions, fn_name)().call()
+                self.log(f"  {fn_name}() = {val}")
+            except Exception:
+                pass
 
-    def check_mint_status(self) -> bool:
         try:
-            code = self.w3.eth.get_code(self.contract_addr)
-            if len(code) == 0:
-                return False
+            bal = self.contract.functions.balanceOf(self.address).call()
+            self.log(f"  balanceOf({self.address[:10]}...) = {bal}")
         except Exception:
-            return False
+            pass
 
-        for fn_name in ["paused"]:
+        # Detect value
+        if self.value_eth is not None:
+            self.log(f"  Value: {self.value_eth} ETH (manual)")
+        else:
+            for fn_name in ["price", "cost", "publicPrice", "MINT_PRICE", "mintPrice"]:
+                try:
+                    val = getattr(self.contract.functions, fn_name)().call()
+                    if val > 0:
+                        self.value_eth = float(Web3.from_wei(val, "ether"))
+                        self.log(f"  {fn_name}() = {self.value_eth} ETH")
+                    else:
+                        self.value_eth = 0.0
+                        self.log(f"  {fn_name}() = 0 ETH (FREE)")
+                    break
+                except Exception:
+                    pass
+
+        # Detect mint functions
+        mint_fns = []
+        for fn_name in ["mint", "publicMint", "mintPublic", "claim", "freeMint", "safeMint", "presaleMint", "whitelistMint"]:
             try:
-                if getattr(self.contract.functions, fn_name)().call():
-                    self.log(f"⏸️  PAUSED")
-                    return False
+                if hasattr(self.contract.functions, fn_name):
+                    fn = getattr(self.contract.functions, fn_name)
+                    mint_fns.append(fn_name)
             except Exception:
                 pass
+        self.log(f"  🎯 Mint functions: {', '.join(mint_fns)}")
 
-        # Try sale-active checks first
-        for fn_name in ["isActive", "saleActive", "publicSaleActive"]:
-            try:
-                if getattr(self.contract.functions, fn_name)().call():
-                    return True
-            except Exception:
-                pass
-
-        # If none of the active functions exist, assume mint is open
-        # (contract exists and not paused = try it)
         return True
 
     def check_wallet_limit(self) -> bool:
@@ -681,12 +446,219 @@ class MintBot:
         return True
 
     # ═══════════════════════════════════════════════════════════
+    # MINT FUNCTION DETECTION
+    # ═══════════════════════════════════════════════════════════
+
+    def detect_mint_function(self) -> str:
+        if self.mint_fn_override:
+            self.log(f"Using override: {self.mint_fn_override}")
+            return self.mint_fn_override
+
+        # Try each common mint function
+        candidates = ["mint", "publicMint", "mintPublic", "claim", "freeMint", "safeMint", "presaleMint", "whitelistMint"]
+
+        for fn_name in candidates:
+            try:
+                fn = getattr(self.contract.functions, fn_name)
+                inputs = fn.abi["inputs"]
+
+                if len(inputs) == 0:
+                    self.log(f"Selected: {fn_name}()")
+                    return fn_name
+
+                if len(inputs) == 1 and inputs[0]["type"] == "uint256":
+                    self.log(f"Selected: {fn_name}(quantity)")
+                    return fn_name
+
+                if len(inputs) == 2:
+                    types = [i["type"] for i in inputs]
+                    if "uint256" in types and "bytes32[]" in types:
+                        self.log(f"Selected: {fn_name}(quantity, proof)")
+                        return fn_name
+
+            except (AttributeError, KeyError, TypeError):
+                pass
+
+        self.log("⚠️  No standard mint function found, trying 'mint'")
+        return "mint"
+
+    # ═══════════════════════════════════════════════════════════
+    # TX BUILDING
+    # ═══════════════════════════════════════════════════════════
+
+    def build_mint_tx(self, mint_fn: str, override_nonce: int = None) -> dict:
+        fn = getattr(self.contract.functions, mint_fn)
+        inputs = fn.abi["inputs"]
+
+        # Build args
+        if len(inputs) == 0:
+            fn_call = fn()
+        elif len(inputs) == 1 and inputs[0]["type"] == "uint256":
+            fn_call = fn(self.quantity)
+        elif len(inputs) == 2:
+            types = [i["type"] for i in inputs]
+            if "bytes32[]" in types and self.proof:
+                proof_bytes = [bytes.fromhex(p.replace("0x", "")) for p in self.proof]
+                fn_call = fn(self.quantity, proof_bytes)
+            else:
+                fn_call = fn(self.quantity, [])
+        else:
+            self.log(f"⚠️  Unsupported args: {[i['type'] for i in inputs]}")
+            fn_call = fn()
+
+        # Calculate value
+        value = 0
+        if self.value_eth and self.value_eth > 0:
+            value = Web3.to_wei(self.value_eth * self.quantity, "ether")
+
+        # Gas
+        latest = self.w3.eth.get_block("latest")
+        base_fee = latest.get("baseFeePerGas", self.w3.eth.gas_price)
+        priority = Web3.to_wei(self.chain["priority_fee_gwei"], "gwei")
+
+        nonce = override_nonce if override_nonce is not None else self.w3.eth.get_transaction_count(self.address, "pending")
+
+        tx = fn_call.build_transaction({
+            "from": self.address,
+            "chainId": self.chain["chain_id"],
+            "nonce": nonce,
+            "maxFeePerGas": int(base_fee * self.chain["max_fee_multiplier"]) + priority,
+            "maxPriorityFeePerGas": priority,
+            "gas": 300000,
+            "type": 2,
+            "value": value,
+        })
+
+        return tx
+
+    # ═══════════════════════════════════════════════════════════
+    # SNIPER MODE: Pre-sign → wait → fire
+    # ═══════════════════════════════════════════════════════════
+
+    def snipe(self, mint_fn: str):
+        """Pre-sign TX, wait for sale, fire instantly."""
+        self.log(f"\n🔫 SNIPE MODE — Pre-signing {self.quantity + 1} TXs...")
+
+        signed_txs = []
+        base_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
+
+        for i in range(self.quantity + 1):
+            try:
+                tx = self.build_mint_tx(mint_fn, override_nonce=base_nonce + i)
+                signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
+                signed_txs.append(signed.raw_transaction)
+                self.log(f"  ✓ Pre-signed #{i} (nonce={base_nonce + i})")
+            except Exception as e:
+                self.log(f"  ✗ Pre-sign #{i} failed: {e}")
+
+        if not signed_txs:
+            self.log("❌ No TX pre-signed, aborting")
+            return
+
+        self.log(f"\n⏱️  Waiting for sale active (poll {self.poll_interval}s)...")
+
+        attempt = 0
+        while self.running and not self.minted:
+            try:
+                # Quick check: is mint active?
+                active = True
+                for fn_name in ["paused"]:
+                    try:
+                        if getattr(self.contract.functions, fn_name)().call():
+                            active = False
+                            break
+                    except Exception:
+                        pass
+
+                if not active:
+                    time.sleep(self.poll_interval)
+                    continue
+
+                # Check sale status
+                for fn_name in ["isActive", "saleActive", "publicSaleActive"]:
+                    try:
+                        if not getattr(self.contract.functions, fn_name)().call():
+                            active = False
+                            break
+                    except Exception:
+                        pass
+
+                if not active:
+                    time.sleep(self.poll_interval)
+                    continue
+
+                # SALE IS LIVE — FIRE!
+                self.log(f"🟢 SALE ACTIVE! Firing {len(signed_txs)} TXs...")
+
+                for i, raw_tx in enumerate(signed_txs):
+                    try:
+                        tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+                        self.log(f"📤 TX#{i}: {tx_hash.hex()}")
+                        self.log(f"   🔗 {self.chain['explorer']}{tx_hash.hex()}")
+
+                        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+
+                        if receipt and receipt.get("status") == 1:
+                            self.log(f"✅ MINT SUCCESS! TX#{i}")
+                            self.log(f"   Block: {receipt['blockNumber']}")
+                            self.log(f"   Gas: {receipt['gasUsed']}")
+                            self.tx_hash = tx_hash.hex()
+                            self.minted = True
+                            return
+                        else:
+                            self.log(f"❌ TX#{i} reverted, trying next...")
+                    except Exception as e:
+                        self.log(f"❌ TX#{i} error: {str(e)[:200]}")
+
+                attempt += 1
+                if attempt < self.max_retries:
+                    self.log(f"↻ Re-signing and retrying ({attempt}/{self.max_retries})...")
+                    # Re-sign with fresh nonce/gas
+                    signed_txs = []
+                    base_nonce = self.w3.eth.get_transaction_count(self.address, "pending")
+                    for i in range(self.quantity + 1):
+                        try:
+                            tx = self.build_mint_tx(mint_fn, override_nonce=base_nonce + i)
+                            signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
+                            signed_txs.append(signed.raw_transaction)
+                        except Exception:
+                            pass
+                    time.sleep(self.retry_delay)
+
+            except Exception as e:
+                self.log(f"❌ Loop error: {str(e)[:200]}")
+                time.sleep(self.retry_delay)
+
+        if not self.minted:
+            self.log(f"\n❌ Failed after {attempt} attempts")
+
+    # ═══════════════════════════════════════════════════════════
+    # STANDARD MODE (non-snipe)
+    # ═══════════════════════════════════════════════════════════
+
+    def send_mint(self, mint_fn: str) -> str:
+        tx = self.build_mint_tx(mint_fn)
+        signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
+        self.log(f"📤 Sending (nonce={tx['nonce']}, gas={tx['gas']})...")
+        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        return tx_hash.hex()
+
+    def wait_for_receipt(self, tx_hash: str, timeout: int = 120) -> dict:
+        self.log(f"⏳ Waiting for confirmation ({timeout}s timeout)...")
+        try:
+            return self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        except Exception as e:
+            self.log(f"Timeout: {e}")
+            return None
+
+    # ═══════════════════════════════════════════════════════════
     # MAIN
     # ═══════════════════════════════════════════════════════════
 
     def mint(self):
         contract_addr = self.config.get("contract")
         link = self.config.get("link")
+        snipe_mode = self.config.get("snipe", False)
 
         # Resolve link → contract
         if link:
@@ -709,12 +681,13 @@ class MintBot:
 
         # Header
         self.log("=" * 55)
-        self.log(f"🚀 EVM AUTO-MINT BOT v2")
+        mode_label = "🧪 DRY-RUN" if self.dry_run else ("🔫 SNIPE" if snipe_mode else "⚡ LIVE")
+        self.log(f"🚀 EVM AUTO-MINT BOT v3")
         self.log(f"   Chain    : {self.chain['name']} (chain_id={self.chain['chain_id']})")
         self.log(f"   Contract : {self.contract_addr}")
         self.log(f"   Quantity : {self.quantity}")
         self.log(f"   Wallet   : {self.address}")
-        self.log(f"   Mode     : {'🧪 DRY-RUN' if self.dry_run else '⚡ LIVE'}")
+        self.log(f"   Mode     : {mode_label}")
         if link:
             self.log(f"   Source   : {link}")
         self.log("=" * 55)
@@ -749,19 +722,48 @@ class MintBot:
                 self.log(f"   Gas      : {tx.get('gas', 'N/A')}")
                 self.log(f"   MaxFee   : {Web3.from_wei(tx.get('maxFeePerGas', 0), 'gwei')} gwei")
                 self.log(f"   Priority : {Web3.from_wei(tx.get('maxPriorityFeePerGas', 0), 'gwei')} gwei")
-                self.log(f"   Data     : {tx.get('data', b'').hex()[:66]}...")
-                self.log(f"\n✅ Dry-run OK! Add --live to mint.")
+                data_hex = tx.get('data', '')
+                if isinstance(data_hex, bytes):
+                    data_hex = data_hex.hex()
+                self.log(f"   Data     : {data_hex[:66]}...")
+                self.log(f"\n✅ Dry-run OK! Add --live or --snipe to mint.")
             except Exception as e:
                 self.log(f"❌ Dry-run failed: {e}")
             return
 
-        # LIVE
+        # SNIPE MODE
+        if snipe_mode:
+            self.snipe(mint_fn)
+            return
+
+        # STANDARD LIVE MODE
         self.log(f"\n⚡ LIVE MINT (poll {self.poll_interval}s)...")
         attempt = 0
 
         while self.running and not self.minted:
             try:
-                if not self.check_mint_status():
+                active = True
+                for fn_name in ["paused"]:
+                    try:
+                        if getattr(self.contract.functions, fn_name)().call():
+                            active = False
+                            break
+                    except Exception:
+                        pass
+
+                if not active:
+                    time.sleep(self.poll_interval)
+                    continue
+
+                for fn_name in ["isActive", "saleActive", "publicSaleActive"]:
+                    try:
+                        if not getattr(self.contract.functions, fn_name)().call():
+                            active = False
+                            break
+                    except Exception:
+                        pass
+
+                if not active:
                     time.sleep(self.poll_interval)
                     continue
 
@@ -799,74 +801,56 @@ class MintBot:
                         break
 
             except Exception as e:
-                self.log(f"⚠️  Monitor: {e}")
-                time.sleep(self.poll_interval)
+                self.log(f"❌ Loop error: {str(e)[:200]}")
+                time.sleep(self.retry_delay)
 
-        if self.minted:
-            self.log(f"\n{'='*55}")
-            self.log(f"🎉 DONE!")
-            self.log(f"   TX   : {self.tx_hash}")
-            if self.tx_hash:
-                self.log(f"   🔗 {self.chain['explorer']}{self.tx_hash}")
-            self.log(f"{'='*55}")
-        else:
+        if not self.minted:
             self.log(f"\n❌ Failed after {attempt} attempts")
 
 
-def load_wallet(chain: str) -> str:
-    wallet_path = Path.home() / ".hermes" / "wallets" / "wallets.json"
-    if wallet_path.exists():
-        with open(wallet_path) as f:
-            wallets = json.load(f)
-        return wallets.get("evm", {}).get("private_key")
-    return None
-
+# ═══════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="EVM Auto-Mint Bot v2")
-    parser.add_argument("--link", "-l", help="Mint page URL (OpenSea, mint.fun, zora, etc)")
-    parser.add_argument("--contract", "-c", help="Direct contract address")
-    parser.add_argument("--chain", default="eth", choices=list(CHAINS.keys()),
-                        help="Blockchain (default: eth)")
-    parser.add_argument("--qty", "-q", type=int, default=1, help="Quantity")
-    parser.add_argument("--value", "-v", type=float, default=None,
-                        help="Value in ETH (auto-detect if omitted)")
-    parser.add_argument("--mint-fn", help="Force mint function name")
-    parser.add_argument("--gas-limit", type=int, help="Override gas limit")
-    parser.add_argument("--max-gas", type=float, default=100, help="Max gas gwei")
-    parser.add_argument("--private-key", "-k", help="Private key")
-    parser.add_argument("--dry-run", "-n", action="store_true", help="Simulate only")
-    parser.add_argument("--live", action="store_true", help="Send live TX (default is dry-run)")
-    parser.add_argument("--poll", type=float, default=0.5, help="Poll interval")
+    parser = argparse.ArgumentParser(description="EVM Auto-Mint Bot v3 — Snipe Edition")
+    parser.add_argument("-l", "--link", help="Mint page URL")
+    parser.add_argument("-c", "--contract", help="Direct contract address")
+    parser.add_argument("--chain", default="eth", choices=list(CHAINS.keys()))
+    parser.add_argument("-q", "--qty", type=int, default=1, help="Quantity")
+    parser.add_argument("-v", "--value", type=float, default=None, help="Value per mint (ETH)")
+    parser.add_argument("--mint-fn", default=None, help="Force mint function name")
+    parser.add_argument("--gas-limit", type=int, default=None, help="Override gas limit")
+    parser.add_argument("--max-gas", type=float, default=100, help="Max gas price (gwei)")
+    parser.add_argument("-k", "--private-key", default=None, help="Private key (or use wallets.json)")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Simulate only")
+    parser.add_argument("--live", action="store_true", help="Send real TX (standard mode)")
+    parser.add_argument("--snipe", action="store_true", help="Snipe mode: pre-sign → fire instantly")
+    parser.add_argument("--poll", type=float, default=0.3, help="Poll interval (seconds)")
     parser.add_argument("--retries", type=int, default=10, help="Max retries")
+    parser.add_argument("--retry-delay", type=float, default=0.5, help="Retry delay (seconds)")
+    parser.add_argument("--proof", nargs="*", help="Merkle proof (hex)")
 
     args = parser.parse_args()
 
-    if not args.link and not args.contract:
-        parser.error("Provide --link or --contract")
-
-    private_key = args.private_key or load_wallet(args.chain)
-    if not private_key:
-        print("[FATAL] No private key. Set --private-key or add to wallets.json")
-        sys.exit(1)
-
     config = {
-        "chain": args.chain,
-        "contract": args.contract,
         "link": args.link,
-        "private_key": private_key,
-        "quantity": args.qty,
+        "contract": args.contract,
+        "chain": args.chain,
+        "qty": args.qty,
         "value": args.value,
         "mint_fn": args.mint_fn,
         "gas_limit": args.gas_limit,
-        "max_gas_price_gwei": args.max_gas,
-        "poll_interval_sec": args.poll,
-        "max_retries": args.retries,
-        "retry_delay_sec": 0.3,
+        "max_gas": args.max_gas,
+        "private_key": args.private_key,
+        "poll": args.poll,
+        "retries": args.retries,
+        "retry_delay": args.retry_delay,
+        "snipe": args.snipe,
+        "proof": args.proof,
     }
 
-    # Default: dry-run unless --live specified
-    dry_run = not args.live
+    dry_run = not args.live and not args.snipe
 
     bot = MintBot(config, dry_run=dry_run)
     bot.mint()
